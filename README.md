@@ -69,15 +69,21 @@
 git clone <repo-url>
 cd code-doc-assistant
 
-# Default: full tier (Mistral Nemo 12B)
-docker compose up
+# Quickest start (auto-detects GPU, defaults to lightweight tier):
+./run.sh
 
-# Or specify a lighter tier:
-MODEL_TIER=balanced docker compose up     # Qwen2.5-Coder 7B
-MODEL_TIER=lightweight docker compose up  # Phi-3.5 Mini 3.8B
+# Or manually — CPU-only (default):
+MODEL_TIER=lightweight docker compose up --build
+
+# With GPU acceleration:
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
+
+# Specify tier:
+MODEL_TIER=balanced docker compose up --build     # Qwen2.5-Coder 7B
+MODEL_TIER=full docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
 
 # With a custom embedding model:
-EMBEDDING_MODEL=all-minilm MODEL_TIER=lightweight docker compose up
+EMBEDDING_MODEL=all-minilm MODEL_TIER=lightweight docker compose up --build
 ```
 Then open `http://localhost:8501` in your browser.
 
@@ -455,7 +461,7 @@ The current implementation uses Ollama as the inference server — specifically 
 
 **Context and sequence length optimisation**: Larger context windows (32K+ tokens) enable ingesting entire files or multi-file contexts in a single query, reducing the chunking granularity problem. vLLM's PagedAttention makes long-context inference practical without proportional memory scaling. This connects directly to the adaptive retrieval question — with sufficient context window, the system could retrieve at file-level granularity rather than function-level, answering architectural questions more effectively.
 
-**Multi-GPU and hardware-aware deployment**: With multiple GPUs available, tensor parallelism (splitting model layers across GPUs) and pipeline parallelism (splitting the pipeline stages) become options. The embedding model and LLM could run on separate GPUs, eliminating the shared-VRAM constraint noted in the cloud resources table, and enabling more complex, helm-based (or, why not, Argo Workflow) deployments — yes, I am aware that these are the main use cases where the scalable design assumed from the start of this design exercise would truly shine. Architecture-specific optimisations (FlashAttention-2 for Ampere+ GPUs, INT8 inference on Turing GPUs) and hardware placement (co-locating the vector DB on NVMe SSDs, placing Ollama/vLLM on GPU nodes) would further improve throughput. And speaking of hardware placement and throughputs, some other very interesting problems (that on-prem would be even more interesting to look at and explore) would be the use of InfiniBand technologies (that NVidia now own), for NVLink and ConnectX switching, but also the sizing and system optimisation of inter-server/inter-node network resources and management.
+**Multi-GPU and hardware-aware deployment**: With multiple GPUs available, tensor parallelism (splitting model layers across GPUs) and pipeline parallelism (splitting the pipeline stages) become options. The embedding model and LLM could run on separate GPUs, eliminating the shared-VRAM constraint noted in the cloud resources table, and enabling more complex, helm-based (or, why not, Argo Workflow) deployments — yes, I am aware that these are the main use cases where the scalable design assumed from the start of this design exercise would truly shine. Architecture-specific optimisations — FlashAttention-2 for Ampere+ GPUs, INT8 inference on Turing, INT4 on Ampere, and native FP4 on NVIDIA's Blackwell architecture (B100/B200/GB200) — continue to push the boundary of what model sizes are practical on a given GPU. While Blackwell-class hardware may not be readily available for this project, the trajectory is clear: each GPU generation enables running larger models at lower precision with hardware-native support, making the quantisation strategy increasingly viable for production deployment. Hardware placement also matters: co-locating the vector DB on NVMe SSDs, placing Ollama/vLLM on GPU nodes. And speaking of hardware placement and throughputs, some other very interesting problems (that on-prem would be even more interesting to look at and explore) would be the use of InfiniBand technologies (that NVidia now own), for NVLink and ConnectX switching, but also the sizing and system optimisation of inter-server/inter-node network resources and management.
 
 **Network and switching optimisation**: In distributed deployments (separate nodes for inference, vector DB, and app), network topology matters. NVLink for multi-GPU communication, RDMA/InfiniBand for inter-node model parallelism, and even simple considerations like co-locating the app and vector DB to minimise retrieval latency. These are the kinds of infrastructure decisions that separate a working prototype from a production system.
 
