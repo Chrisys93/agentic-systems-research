@@ -1,0 +1,226 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: code-doc-ingest
+  namespace: default
+  labels:
+    app.kubernetes.io/part-of: code-doc-assistant
+    app.kubernetes.io/component: ingestion
+spec:
+  # ============================================================
+  # Ingestion DAG — triggered manually or by a CronWorkflow
+  # on new commits. Replaces the bootstrap container from main.
+  #
+  # Steps:
+  #   1. clone        — git clone / pull the target repo
+  #   2. discover     — find all source files, classify by type
+  #   3. chunk        — AST/text chunking (parallel per file type)
+  #   4. embed        — generate embeddings via Ollama
+  #   5. store        — upsert into ChromaDB
+  #   6. log-metrics  — record ingestion stats to MLflow
+  # ============================================================
+
+  entrypoint: ingest-dag
+  serviceAccountName: code-doc-assistant
+  arguments:
+    parameters:
+      - name: repo-url
+        value: ""
+      - name: repo-ref
+        value: "main"
+      - name: model-tier
+        value: "full"
+      - name: embedding-model
+        value: "nomic-embed-text"
+      - name: collection-name
+        value: "code_chunks"
+
+  volumes:
+    - name: repo-data
+      emptyDir: {}
+
+  templates:
+
+    # -------------------------------------------------------
+    # DAG definition
+    # -------------------------------------------------------
+    - name: ingest-dag
+      dag:
+        tasks:
+          - name: clone
+            template: clone-repo
+            arguments:
+              parameters:
+                - name: repo-url
+                  value: "{{workflow.parameters.repo-url}}"
+                - name: repo-ref
+                  value: "{{workflow.parameters.repo-ref}}"
+
+          - name: discover
+            template: discover-files
+            dependencies: [clone]
+
+          - name: chunk-code
+            template: chunk-files
+            dependencies: [discover]
+            arguments:
+              parameters:
+                - name: file-type
+                  value: "code"
+                - name: model-tier
+                  value: "{{workflow.parameters.model-tier}}"
+
+          - name: chunk-text
+            template: chunk-files
+            dependencies: [discover]
+            arguments:
+              parameters:
+                - name: file-type
+                  value: "text"
+                - name: model-tier
+                  value: "{{workflow.parameters.model-tier}}"
+
+          - name: embed-and-store
+            template: embed-store
+            dependencies: [chunk-code, chunk-text]
+            arguments:
+              parameters:
+                - name: embedding-model
+                  value: "{{workflow.parameters.embedding-model}}"
+                - name: collection-name
+                  value: "{{workflow.parameters.collection-name}}"
+
+          - name: log-metrics
+            template: log-to-mlflow
+            dependencies: [embed-and-store]
+
+    # -------------------------------------------------------
+    # Step templates
+    # -------------------------------------------------------
+
+    - name: clone-repo
+      inputs:
+        parameters:
+          - name: repo-url
+          - name: repo-ref
+      container:
+        image: alpine/git:latest
+        command: [sh, -c]
+        args:
+          - |
+            echo "Cloning {{inputs.parameters.repo-url}} @ {{inputs.parameters.repo-ref}}"
+            git clone --depth=1 --branch {{inputs.parameters.repo-ref}} \
+              {{inputs.parameters.repo-url}} /mnt/repo
+            echo "Clone complete. Files:"
+            find /mnt/repo -type f | head -20
+        volumeMounts:
+          - name: repo-data
+            mountPath: /mnt/repo
+
+    - name: discover-files
+      container:
+        image: code-doc-assistant:latest
+        command: [python3, -c]
+        args:
+          - |
+            import sys, json
+            sys.path.insert(0, '/app/src')
+            from ingest import discover_files
+            files = discover_files('/mnt/repo')
+            print(json.dumps({'code_files': files['code'], 'text_files': files['text']}))
+        volumeMounts:
+          - name: repo-data
+            mountPath: /mnt/repo
+
+    - name: chunk-files
+      inputs:
+        parameters:
+          - name: file-type    # "code" | "text"
+          - name: model-tier
+      container:
+        image: code-doc-assistant:latest
+        command: [python3, -c]
+        args:
+          - |
+            import sys
+            sys.path.insert(0, '/app/src')
+            from ingest import chunk_files
+            chunk_files(
+                repo_path='/mnt/repo',
+                file_type='{{inputs.parameters.file-type}}',
+                model_tier='{{inputs.parameters.model-tier}}',
+                output_dir='/mnt/chunks/{{inputs.parameters.file-type}}'
+            )
+        volumeMounts:
+          - name: repo-data
+            mountPath: /mnt/repo
+      # Chunk-code and chunk-text run in parallel (no dependency between them)
+
+    - name: embed-store
+      inputs:
+        parameters:
+          - name: embedding-model
+          - name: collection-name
+      container:
+        image: code-doc-assistant:latest
+        command: [python3, -c]
+        args:
+          - |
+            import sys
+            sys.path.insert(0, '/app/src')
+            from ingest import embed_and_store
+            embed_and_store(
+                chunks_dir='/mnt/chunks',
+                embedding_model='{{inputs.parameters.embedding-model}}',
+                chroma_host='http://chromadb:8000',
+                collection_name='{{inputs.parameters.collection-name}}'
+            )
+        env:
+          - name: OLLAMA_HOST
+            value: "http://ollama:11434"
+        volumeMounts:
+          - name: repo-data
+            mountPath: /mnt/repo
+
+    - name: log-to-mlflow
+      container:
+        image: code-doc-assistant:latest
+        command: [python3, -c]
+        args:
+          - |
+            import mlflow, os
+            mlflow.set_tracking_uri(os.environ.get('MLFLOW_TRACKING_URI', 'http://mlflow:5000'))
+            mlflow.set_experiment('code-doc-assistant-ingestion')
+            with mlflow.start_run(run_name='ingest-{{workflow.name}}'):
+                mlflow.log_param('repo_url', '{{workflow.parameters.repo-url}}')
+                mlflow.log_param('repo_ref', '{{workflow.parameters.repo-ref}}')
+                mlflow.log_param('embedding_model', '{{workflow.parameters.embedding-model}}')
+                # TODO: log actual chunk/embedding counts from prior steps
+                print('Ingestion metrics logged to MLflow.')
+        env:
+          - name: MLFLOW_TRACKING_URI
+            valueFrom:
+              configMapKeyRef:
+                name: code-doc-assistant-config
+                key: MLFLOW_TRACKING_URI
+
+---
+# CronWorkflow — re-ingest on a schedule (e.g. nightly)
+apiVersion: argoproj.io/v1alpha1
+kind: CronWorkflow
+metadata:
+  name: code-doc-ingest-nightly
+  namespace: default
+spec:
+  schedule: "0 2 * * *"    # 02:00 UTC daily
+  timezone: "UTC"
+  suspend: true             # set to false to enable
+  workflowSpec:
+    workflowTemplateRef:
+      name: code-doc-ingest
+    arguments:
+      parameters:
+        - name: repo-url
+          value: ""         # override at deploy time
+        - name: repo-ref
+          value: "main"

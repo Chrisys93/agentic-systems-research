@@ -2,11 +2,18 @@
 # Code Documentation Assistant — Docker Compose (Local Dev)
 # ============================================================
 # Usage:
-#   docker compose up                          # default: full tier
-#   MODEL_TIER=lightweight docker compose up   # lightweight tier
-#   docker compose up --build                  # rebuild after code changes
+#   docker compose up                           # default: full tier
+#   MODEL_TIER=lightweight docker compose up    # lightweight tier
+#   docker compose up --build                   # rebuild after code changes
+#   docker compose --profile observability up   # + MLflow tracking server
 #
-# Access: http://localhost:8501
+# GPU acceleration:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up
+#   (or use ./run.sh — auto-detects GPU)
+#
+# Access:
+#   Streamlit UI: http://localhost:8501
+#   MLflow UI:    http://localhost:5000  (--profile observability only)
 # ============================================================
 
 services:
@@ -32,7 +39,7 @@ services:
 
   # --- Model Bootstrap ---
   # Pulls the LLM and embedding models on first startup.
-  # Runs once then exits — the models persist in the ollama_data volume.
+  # Runs once then exits — models persist in the ollama_data volume.
   ollama-bootstrap:
     image: ollama/ollama:latest
     container_name: code-doc-bootstrap
@@ -47,7 +54,6 @@ services:
       bash -c '
         echo "=== Bootstrapping models ==="
 
-        # Resolve LLM model from tier
         case "$${MODEL_TIER}" in
           full)        MODEL="mistral-nemo" ;;
           balanced)    MODEL="qwen2.5-coder:7b" ;;
@@ -84,6 +90,36 @@ services:
       retries: 5
       start_period: 10s
 
+  # --- MLflow tracking server (optional — profile: observability) ---
+  # Included here so the research repo's master branch can inherit it without
+  # needing to add a new service. Disabled by default to keep the basic
+  # `docker compose up` experience unchanged.
+  #
+  # Enable with:
+  #   docker compose --profile observability up
+  #
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    container_name: code-doc-mlflow
+    profiles: ["observability"]
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow_data:/mlflow
+    command:
+      - mlflow
+      - server
+      - --host=0.0.0.0
+      - --port=5000
+      - --backend-store-uri=sqlite:////mlflow/mlflow.db
+      - --default-artifact-root=/mlflow/artifacts
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
   # --- Application (Streamlit UI + RAG pipeline) ---
   app:
     build:
@@ -103,12 +139,17 @@ services:
       - MODEL_TIER=${MODEL_TIER:-full}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-nomic-embed-text}
       - LOG_LEVEL=${LOG_LEVEL:-info}
+      # MLflow is optional in main — only connected when the observability profile is active.
+      # The app tolerates a missing MLFLOW_TRACKING_URI gracefully (all MLflow calls are
+      # wrapped in try/except throughout). Set this to connect to an external MLflow server:
+      - MLFLOW_TRACKING_URI=${MLFLOW_TRACKING_URI:-}
     volumes:
-      # Mount a local repo for ingestion (optional)
       - ${REPO_PATH:-./repos}:/data/repos:ro
 
 volumes:
   ollama_data:
     driver: local
   chroma_data:
+    driver: local
+  mlflow_data:
     driver: local

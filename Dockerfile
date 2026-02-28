@@ -17,7 +17,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY src/ ./src/
 
 # Ensure src is importable as a package
-ENV PYTHONPATH=/app
+ENV PYTHONPATH=/app:/app/src
 
 # Streamlit config — disable telemetry, set port
 ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false

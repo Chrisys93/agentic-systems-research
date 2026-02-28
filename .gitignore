@@ -28,3 +28,10 @@ repos/
 
 # README versioning
 READMEv0.md
+
+# MLflow local runs (when run outside compose)
+mlruns/
+mlflow.db
+
+# vLLM model cache (local testing)
+vllm_cache/

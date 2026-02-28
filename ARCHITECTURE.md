@@ -2,7 +2,7 @@
 
 This document captures the thinking behind the component choices and design patterns in the Code Documentation Assistant. It's written chronologically — decisions are recorded as they were made, not reconstructed after the fact. The aim is to preserve the actual reasoning, including dead ends and trade-offs, rather than presenting a sanitised post-hoc narrative.
 
-A plan was made at the outset, defining the approach in four phases: LLM provider selection, pipeline planning, deployment format, and component selection. Implementation and testing followed as phases 5 and 6.
+A plan was made at the outset, defining the approach in four phases: LLM provider selection, pipeline planning, deployment format, and component selection. Implementation and testing followed as phases 5 and 6. The `dev` branch evolution — agent pipeline, HITL, vLLM integration, MLflow, Argo Workflows — is documented in phases 7 onwards.
 
 ---
 
@@ -134,7 +134,7 @@ LSH came up during evaluation as an alternative indexing strategy. Building pers
 
 ### 4d. Orchestration Framework
 
-**Decision: LlamaIndex for the RAG pipeline; LangChain documented as a future growth path.**
+**Decision: LlamaIndex for the RAG pipeline; LangGraph adopted in `dev` for the agent pipeline.**
 
 LlamaIndex is purpose-built for RAG: native `CodeSplitter` with AST-aware chunking, tree-structured indexes, lighter weight than LangChain for pure retrieval-and-respond workflows.
 
@@ -142,7 +142,7 @@ LlamaIndex is purpose-built for RAG: native `CodeSplitter` with AST-aware chunki
 
 **Evolution of thinking — from "which framework" to "what question am I actually answering":**
 
-The instinct was to reach for LangChain — it's the default answer for AI orchestration. But LangChain is a general-purpose framework; this project is focused RAG. The real orchestration question isn't "which framework chains my prompts" but "how does this system scale operationally?" That's answered by MLflow/W&B for tracking and Ray/K8s for compute, not by a prompt-chaining library. LangChain enters the picture when the *application scope* grows (agents, tool use, CI/CD integration), not when the infrastructure scales.
+The instinct was to reach for LangChain — it's the default answer for AI orchestration. But LangChain is a general-purpose framework; this project is focused RAG. The real orchestration question isn't "which framework chains my prompts" but "how does this system scale operationally?" That's answered by MLflow/W&B for tracking and Ray/K8s for compute, not by a prompt-chaining library. LangChain — specifically LangGraph — enters the picture when the *application scope* grows (agents, tool use, HITL, conditional graphs), which is exactly what the `dev` branch does.
 
 ### 4e. Code Chunking Strategy
 
@@ -171,6 +171,9 @@ Fixed-window chunking is the naive approach. A function split mid-body produces 
 
 Streamlit provides a ChatGPT-style interface with `st.chat_input()` and `st.chat_message()` in pure Python — functional and clean.
 
+`master`: simple chat UI with sidebar ingestion controls.
+`dev`: tabbed layout — **Chat** (conversation + HITL widgets), **Pipeline** (full-width graph diagram with live execution trace highlighting), **Session** (accumulated preference profile, supervisor audit trail, MLflow run link).
+
 **Access patterns**:
 
 | Method | Context | Helm config |
@@ -193,6 +196,8 @@ RAG is not unconditionally beneficial. Research shows retrieval noise can active
 - **Cross-file confusion**: similar naming across modules causes conflation
 
 **Mitigations implemented**: similarity score cutoff (0.3), metadata preservation (file paths and languages in prompt), source attribution in every response.
+
+The `dev` branch extends this with two supervisor-level guardrails: a pre-generation confidence gate (retrieval quality check before the generation node runs) and a post-generation quality gate (rubric-scored LLM evaluation when `OUTPUT_REVIEW_MODE=supervisor`).
 
 **Evolution of thinking — from "RAG always helps" to understanding when it hurts:**
 
@@ -247,15 +252,111 @@ The temptation was to gloss over resource constraints and imply thorough testing
 
 ---
 
+## Phase 7: `dev` Branch — Why an Agent Pipeline?
+
+The `master` branch answers "what does this code do?" reliably via a linear pipeline: ingest → embed → retrieve → respond. The `dev` branch asks a harder question: what if the system needed to *decide how* to find the answer — choosing between grep, AST parsing, vector search, or GitHub fetch depending on the query — and what if a human needed to review that plan before any tools ran?
+
+This changes the execution model from a linear pipeline (fixed stages, predictable path) to a conditional graph (node routing, feedback loops, human interrupt points). The right tool for this is LangGraph.
+
+**Evolution of thinking — from "add tools" to "redesign the execution model":**
+
+The instinct was to layer tool use on top of the existing RAG pipeline. The reframe came from recognising that tool selection is itself a decision that benefits from human oversight — not because the LLM can't choose tools, but because in a code documentation context the human often has knowledge the tool-selection agent doesn't: which files are the canonical source of truth, which directories are generated and should be skipped, what the current task's scope actually is. HITL-1 (tool plan approval) exists to transfer that contextual knowledge into the pipeline before any tools execute.
+
+---
+
+## Phase 8: Agent Graph Design
+
+**Decision: LangGraph `StateGraph` with nine nodes and two configurable interrupt points.**
+
+```
+START → tool_selection →[HITL-1]→ tool_execution → supervisor ⟲
+      → context_assembly → generation → output_review →[HITL-2]→ END
+```
+
+`[HITL-1]` = `interrupt_before` on `hitl_checkpoint` when `HITL_ENABLED=true`
+`[HITL-2]` = behaviour controlled by `OUTPUT_REVIEW_MODE`
+
+**Graph topology is fixed regardless of `OUTPUT_REVIEW_MODE`**: the `output_review` node always exists and is always connected. The mode controls whether `interrupt_before` is set on it and what logic runs inside it at runtime. This is intentional — the graph structure is a stable contract; runtime behaviour is a configuration concern. It also means `get_graph_mermaid()` always renders the same topology in the Pipeline tab, regardless of mode.
+
+**The supervisor has two distinct responsibilities:**
+
+Pre-generation: evaluates retrieval confidence scores, injects `SessionPreferences` biases (preferred files, response format, verbosity), retries with adjusted parameters if confidence is below threshold.
+
+Post-generation (when `OUTPUT_REVIEW_MODE=supervisor`): evaluates the generated output against a rubric scoring accuracy (0–4), completeness (0–3), and attribution (0–3). Silently retries if total score is below `QUALITY_GATE_THRESHOLD`; accepts if it passes. Human feedback from previous queries (when `OUTPUT_REVIEW_MODE=human`) updates the `SessionPreferences` profile in `AgentState`, which persists across queries within the thread and biases subsequent supervisor behaviour.
+
+**`OUTPUT_REVIEW_MODE` values:**
+
+| Mode | Behaviour | Use case |
+|------|-----------|----------|
+| `human` | HITL-2 interrupt — human rates and decides (accept / regenerate / add context) | Default; highest oversight |
+| `supervisor` | Rubric LLM evaluates output; silent retry if below threshold | Automated quality gate |
+| `self` | Generation LLM self-critiques before emitting; no extra node | Lightweight sanity check |
+| `off` | Passthrough; immediate accept | CI/automated pipelines |
+
+---
+
+## Phase 9: Tool Registry
+
+**Decision: nine tools split between shell-level and semantic.**
+
+Shell tools (`grep`, `cat`, `find`, `git_log`, `git_blame`, `stat`) often outperform semantic search for code documentation tasks — finding a function definition is a `grep` problem, not a vector similarity problem. Semantic tools (`vector_search`, `ast_parse`) handle conceptual questions and cross-file relationship queries. `github_fetch` handles cases where the repo isn't locally mounted.
+
+All shell tools validate paths against `REPO_PATH` and use an allowlisted flag set — no path escape, no arbitrary flag injection. The tool registry pattern (`TOOL_REGISTRY` dict mapping name → `{fn, description, required_args, optional_args}`) keeps tool logic in `tools.py` and graph logic in `agent_graph.py` with no coupling between them.
+
+---
+
+## Phase 10: vLLM Integration
+
+**Decision: `INFERENCE_BACKEND` env var switches between Ollama and vLLM at the `_get_llm()` factory — no other code changes required.**
+
+vLLM exposes an OpenAI-compatible API. `ChatOpenAI` from `langchain-openai`, pointed at `VLLM_HOST/v1`, is functionally identical to any other LangChain chat model from the perspective of every graph node. The `api_key` field is set to `"not-required"` — vLLM ignores it entirely. All nine graph nodes call `_get_llm()` and are backend-agnostic.
+
+`VLLM_MODEL` falls back to `OLLAMA_MODEL`, so `MODEL_TIER` continues to work as the single high-level control for both backends without additional configuration.
+
+The practical distinction between backends: Ollama is for developer convenience — auto-pull, CPU fallback, single-command setup. vLLM is for team deployments under concurrent load: continuous batching and PagedAttention make it significantly more efficient when multiple developers are using the tool simultaneously. The switch costs one environment variable.
+
+**Evolution of thinking — from "vLLM as a future note" to wired-in backend:**
+
+The initial ARCHITECTURE.md mentioned vLLM as a "what I'd do with more time" item and `query_engine.py` as the place to add it. In `dev`, it became clear that the right abstraction was the `_get_llm()` factory, not the query engine — the factory is the single point where a LangChain model is constructed, so backend-switching belongs there. The `langchain-openai` package provides `ChatOpenAI`, which handles the OpenAI-compatible API surface. The result is that vLLM is now a first-class deployment option rather than a future consideration, and swapping backends requires no application code changes.
+
+---
+
+## Phase 11: MLflow — Both Branches
+
+**Decision: MLflow available in both branches, with different defaults.**
+
+`dev`: MLflow is always-on in `docker-compose.dev.yml`. Every query creates a run logging: inference backend, resolved model name, HITL settings, output review mode, retrieval confidence metrics, quality gate scores, user satisfaction rating, generation latency, tool calls executed. The Session tab in the Streamlit UI links directly to the last run's MLflow page.
+
+`master`: MLflow is opt-in via `--profile observability`. A plain `docker compose up` is entirely unchanged for existing users. Adding it to `master` rather than keeping it `dev`-only means the research repo's master branch can inherit it without needing to introduce a new service — it's already present in the compose file, gated behind a profile flag. The app handles a missing `MLFLOW_TRACKING_URI` gracefully throughout (all MLflow calls are in `try/except`).
+
+The MLflow-vs-W&B decision: W&B requires a licence for team use at scale. MLflow paired with Argo Workflows (Argo for orchestration, MLflow for tracking) covers the same functional ground with no licence cost and cleaner architectural separation of concerns. The combination also makes the system more composable for the research repo: MLflow run IDs become traceable links between code versions, embedding indexes, and the preference data accumulated from HITL interactions.
+
+---
+
+## Phase 12: Argo Workflows
+
+**Decision: Argo `WorkflowTemplate` replaces the `ollama-bootstrap` one-shot container with a proper DAG.**
+
+```
+clone-or-mount → discover-files → chunk-code ─┐
+                                  chunk-text  ─┴→ embed-and-store → log-to-mlflow
+```
+
+`chunk-code` and `chunk-text` run in parallel (different file type sets). A `CronWorkflow` (suspended by default, enabled in production) handles nightly re-ingestion. This moves ingestion from "a thing that happens on container startup" to "a scheduled, observable, retryable pipeline with a logged artefact in MLflow."
+
+The MLflow step at the end of every ingestion run creates a traceable link between a specific code commit and the embedding index built from it — directly relevant for the research repo's cross-session preference work, where it matters which version of the codebase a preference signal was generated against.
+
+---
+
 ## Next Steps
 
-These are concrete, scoped extensions to the current system — things that would improve this specific assistant with more time and resources. They are grounded in what's already built and address known gaps.
+These are concrete, scoped extensions grounded in what's already built.
 
 ### Advanced RAG Mitigations
 
-The similarity cutoff and metadata guardrails in the current implementation are a first line of defence. The next layer of RAG quality improvements:
+The similarity cutoff and metadata guardrails are a first line of defence. The next layer:
 
-- **CRAG (Corrective RAG)** — filtering low-confidence retrievals at inference time, reducing retrieval errors by 12–18%; rather than passing all retrieved chunks to the LLM, a corrective pass identifies and discards chunks below a confidence threshold
+- **CRAG (Corrective RAG)** — filtering low-confidence retrievals at inference time, reducing retrieval errors by 12–18%
 - **Self-RAG** — the model learns to critique its own retrieval usage, deciding whether retrieved context is relevant before incorporating it
 - **Re-ranking** — a secondary model re-scores retrieved chunks before they enter the prompt; computationally cheap relative to inference, but meaningfully improves retrieval precision
 - **Context windowing** — prioritising recently-modified files for timeliness; stale chunks are a known failure mode for active codebases
@@ -268,7 +369,7 @@ The current implementation chunks at function/class level — well-suited for "w
 
 Ollama is the right choice for developer convenience and self-contained deployment. In a production environment with known infrastructure, a different set of optimisations becomes relevant.
 
-**vLLM**: continuous batching, PagedAttention for efficient KV-cache management, native tensor parallelism across multiple GPUs. Where Ollama optimises for developer convenience, vLLM optimises for throughput and latency under concurrent load — critical when serving a team rather than a single developer. It supports OpenAI-compatible API endpoints, making it a drop-in replacement with minimal changes to `query_engine.py`.
+**vLLM**: continuous batching, PagedAttention for efficient KV-cache management, native tensor parallelism across multiple GPUs. Where Ollama optimises for developer convenience, vLLM optimises for throughput and latency under concurrent load — critical when serving a team rather than a single developer. It supports OpenAI-compatible API endpoints, making it a drop-in replacement with minimal changes (already wired in `dev` via `_get_llm()`).
 
 **Quantisation** (GPTQ, AWQ, GGUF): reduces model memory footprint by 50–75% with minimal quality loss for code comprehension tasks. This would allow running the balanced tier on hardware currently limited to the lightweight tier, or the full tier on a single T4 via 4-bit quantisation. Beyond memory savings, quantisation can also increase context capacity and concurrent user support for the same resource envelope — a different set of trade-offs worth evaluating per deployment.
 
@@ -281,6 +382,8 @@ Ollama is the right choice for developer convenience and self-contained deployme
 ### Model Fine-Tuning
 
 The RAG approach means the model receives relevant context at query time, which is sufficient for most questions without fine-tuning. Fine-tuning becomes relevant if base models consistently fail on specific languages or domains, or if a particular documentation style is required. This requires training data (code Q&A pairs), compute, and iteration — guided by observed performance gaps, not assumed in advance.
+
+The `fine-tuning` branch (planned) would use LoRA/QLoRA adapters trained on HITL feedback accumulated in MLflow — cross-session, offline, and gated. This is not within-session fine-tuning: the feedback volume per session is too low and catastrophic forgetting risk is real. The right trigger is when MLflow contains enough preference signal to justify a training run.
 
 ### Credential and Sensitive Data Redaction
 
@@ -308,14 +411,14 @@ This bidirectional composability — each system can be a client or a provider d
 
 ### Branching Structure for a Multi-Environment System
 
-A natural evolution of the current single-branch project into a multi-branch, multi-environment system:
+A natural evolution of the current project into a multi-branch, multi-environment system:
 
-- **`dev`** — active development, experimental features, frequent iteration; uses lightweight tier by default
-- **`fine-tuning`** — model adaptation branch; training data pipelines, evaluation harnesses, LoRA/QLoRA experiments against the codebase-specific Q&A pairs accumulated from production interactions
-- **`production`** — stable, versioned deployments; full Helm chart, GPU-provisioned, monitoring enabled
-- **`research`** — exploratory work; agentic and A2A (agent-to-agent) system prototypes, optimisation experiments, customer-specific system definitions; explicitly not production-bound
+- **`master`** — stable RAG pipeline; reviewer-friendly; single-command startup
+- **`dev`** — agent pipeline; LangGraph; HITL; vLLM; MLflow; Argo Workflows
+- **`fine-tuning`** — model adaptation; training data pipelines; LoRA/QLoRA experiments on Q&A pairs accumulated from HITL interactions
+- **`research`** (separate repo) — online preference learning; federated preference aggregation; autonomous multi-context agent orchestration; explicitly not production-bound
 
-The research branch is where the platform vision above would be prototyped — agentic pipelines that can autonomously ingest, embed, and index new codebases; A2A coordination between specialised assistants; and the infrastructure for bespoke, customer-specific system definitions.
+The research repo is where the platform vision above would be prototyped — agentic pipelines that can autonomously ingest, embed, and index new codebases; agent-to-agent (A2A) coordination between specialised assistants; federated embeddings across teams where each node contributes to a shared index without centralising proprietary code.
 
 ### LSH and Distributed AI
 
@@ -342,7 +445,7 @@ These are genuinely research-level questions — not implementation items — bu
 
 - Python 3.11+, type hints throughout
 - Modular design: each source file maps to a single concern
-- Abstraction layers: vector store interface for DB-agnostic design
-- Configuration: environment-variable driven, with parity between Docker Compose and Helm
-- Testing: pipeline validation with embedded ChromaDB and AST chunking verification
-- Logging: structured logging via Python `logging` module, configurable level
+- Abstraction layers: `VectorStoreBase` ABC for DB-agnostic design; `_get_llm()` factory for backend-agnostic inference
+- Configuration: environment-variable driven, with parity between Docker Compose and Helm at every layer
+- Testing: pipeline validation with embedded ChromaDB; AST chunking verification; graph topology validation (`dev`)
+- Logging: structured logging via Python `logging` module, configurable level; MLflow for experiment-level tracking
