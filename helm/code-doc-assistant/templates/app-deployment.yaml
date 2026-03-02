@@ -25,6 +25,7 @@ spec:
             - containerPort: {{ .Values.app.service.port }}
               name: http
           env:
+            # --- Core (master) ---
             - name: OLLAMA_HOST
               value: {{ include "code-doc-assistant.ollamaHost" . }}
             - name: CHROMA_HOST
@@ -41,25 +42,6 @@ spec:
               value: {{ include "code-doc-assistant.chunkingStrategy" . }}
             - name: LOG_LEVEL
               value: {{ .Values.app.env.LOG_LEVEL | quote }}
-          readinessProbe:
-            httpGet:
-              path: /_stcore/health
-              port: http
-            initialDelaySeconds: 10
-            periodSeconds: 10
-          livenessProbe:
-            httpGet:
-              path: /_stcore/health
-              port: http
-            initialDelaySeconds: 15
-            periodSeconds: 30
-          resources:
-            requests:
-              memory: "512Mi"
-              cpu: "250m"
-            limits:
-              memory: "1Gi"
-              cpu: "1"
             # --- Dev branch additions ---
             - name: INFERENCE_BACKEND
               value: {{ .Values.inferenceBackend | quote }}
@@ -81,3 +63,22 @@ spec:
               value: {{ .Values.maxGenerationAttempts | quote }}
             - name: MAX_CONTEXT_TOKENS
               value: {{ .Values.maxContextTokens | quote }}
+          readinessProbe:
+            httpGet:
+              path: /_stcore/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /_stcore/health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "1"
