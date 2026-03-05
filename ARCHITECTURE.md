@@ -1,451 +1,199 @@
-# Architecture & Design Decisions
+# Architecture & Research Programme
 
-This document captures the thinking behind the component choices and design patterns in the Code Documentation Assistant. It's written chronologically — decisions are recorded as they were made, not reconstructed after the fact. The aim is to preserve the actual reasoning, including dead ends and trade-offs, rather than presenting a sanitised post-hoc narrative.
+This document describes the design of the `llm-agent-research` repository: the `master` branch skeleton, the rationale for each research branch, the connections between them, and the open research questions each branch is intended to answer.
 
-A plan was made at the outset, defining the approach in four phases: LLM provider selection, pipeline planning, deployment format, and component selection. Implementation and testing followed as phases 5 and 6. The `dev` branch evolution — agent pipeline, HITL, vLLM integration, MLflow, Argo Workflows — is documented in phases 7 onwards.
-
----
-
-## Phase 1: LLM Provider — Why Ollama?
-
-**Decision: Ollama with an open-source model.**
-
-The first fork was whether to use a hosted API (OpenAI, Anthropic) or a self-hosted open-source stack. The considerations:
-
-- **Self-contained**: no API keys, no paid accounts required to run or evaluate the system
-- **Infrastructure ownership**: standing up the full inference stack demonstrates CI/CD, deployment, provisioning, and ML/AI footprint awareness — not just API consumption
-- **Privacy**: for a code documentation tool, keeping code local is often a hard requirement. Many organisations cannot send proprietary source code to external APIs. Self-hosting handles this by default
-
-Trade-off acknowledged: hosted APIs produce noticeably better responses for complex code reasoning, especially architectural questions. For a production system where output quality is paramount and privacy constraints are relaxed, a hybrid approach makes sense — local model for routine queries, API fallback for complex reasoning. The self-hosted path is the right default for this use case.
-
-**Evolution of thinking — from "which API" to "own the stack":**
-
-The initial framing was: which hosted API should be used? The reframing came from recognising that the purpose of this system isn't to show which API produces the best answers, but to engineer the appropriate solution and demonstrate depth across the stack. Wrapping an API is a weekend project; standing up the full inference stack — model serving, embedding pipeline, vector storage, Kubernetes-native deployment — demonstrates infrastructure ownership and full-pipeline awareness. The privacy argument reinforced the decision: for a tool that ingests proprietary codebases, self-hosting isn't a nice-to-have, it's a requirement many organisations would insist on.
+It is written to be updated as the research progresses. Decisions are recorded with their reasoning. Open questions are stated explicitly rather than glossed over.
 
 ---
 
-## Phase 2: README-Driven Development
+## Origin and Motivation
 
-**Decision: README as a living design document, developed alongside the code.**
+This repository is forked from [`code-doc-assistant`](https://github.com/Chrisys93/code-doc-assistant), a RAG pipeline for code documentation built with Ollama, LlamaIndex, ChromaDB, and a composable Helm chart tier system. The code documentation assistant demonstrated that a domain-specific AI assistant could be built with clean abstraction boundaries — the LLM tier, embedding model, vector DB, and deployment configuration are all independently swappable.
 
-Rather than coding first and documenting later, the README was developed in parallel, capturing decision points — especially inflexion points — as they happened.
+The research question this repo pursues is: what happens when you take that composable skeleton and extend it toward genuinely agentic behaviour — online learning, multi-agent coordination, federated knowledge sharing?
 
-**Evolution of thinking:**
-
-Writing the README *during* development captures the actual thought process: blind alleys explored, trade-offs weighed, moments where understanding shifted. It also functions as a rubber duck — several technical choices (especially around embedding model selection and vector DB architecture) were refined because writing them down forced sharper thinking.
+The `code-doc-assistant` repo continues as a product-oriented codebase (with its own `dev`, `fine-tuning`, and `production` branches). This repo is the research counterpart: the same infrastructure foundations, but with stability guarantees relaxed in favour of experimental depth.
 
 ---
 
-## Phase 3: Deployment — Docker Compose and Helm
+## `master` — The Generic Skeleton
 
-**Decision: both, serving different purposes.**
+The `master` branch strips the `code-doc-assistant` down to its reusable core:
 
-| Aspect | Docker Compose | Helm Chart |
-|--------|---------------|------------|
-| Purpose | Local dev, single-command startup | Production-grade K8s deployment |
-| Audience | Anyone with Docker installed | K8s cluster operators |
-| What it shows | Containerisation | Architecture as infrastructure-as-code |
+**Removed** (domain-specific to code documentation):
+- AST-aware chunking via tree-sitter
+- Code-specific prompt templates
+- File-type classification (`.py`, `.js`, etc.)
+- `CodeSplitter` and its `tree-sitter-language-pack` dependency
 
-The more interesting reason to have both is what the Helm chart forces you to think about. When you model the system as Kubernetes objects, the architecture becomes explicit:
+**Retained** (generic, reusable):
+- Composable model tier system (`full` / `balanced` / `lightweight`)
+- `VectorStoreBase` ABC with `ChromaVectorStoreImpl` — swappable to Qdrant or FAISS
+- Tier-aware configuration via `config.py` (mirrors `_helpers.tpl` logic)
+- MLflow instrumentation hooks throughout the pipeline
+- Docker Compose + Helm chart with the same composability patterns
+- `SentenceSplitter` as the default chunking strategy (language-agnostic)
 
-- **Ollama** → StatefulSet (model weights are persistent state)
-- **ChromaDB** → StatefulSet (vector index is persistent state)
-- **Application** → Deployment (stateless, horizontally scalable)
+The result is a pipeline that can be pointed at any document corpus, ingested, embedded, and queried — with no assumptions about the domain. Any research branch that needs domain-specific behaviour adds it in branch-specific code, never modifying `core/`.
 
-The Helm chart also surfaced the composability patterns (the `_helpers.tpl` tier system) that wouldn't have emerged from Docker Compose alone — Compose doesn't have the same templating, system-wide programmability, or automation-ready power.
+### The MLflow Instrumentation Layer
+
+The most important addition in `master` (relative to `code-doc-assistant`) is the `instrumentation/` module. This defines the canonical MLflow logging schema shared between this repo and the `code-doc-assistant` `dev` branch.
+
+The motivation: the `orchestrated` branch's long-loop optimisation consumes execution traces produced by `dev`. Without a shared schema, the two repos can't interoperate. The schema is defined here (as the research repo is the consumer) and `dev` must conform to it.
+
+See `instrumentation/mlflow_schema.py` for the full field definitions and `README.md` for the field reference table.
 
 ---
 
-## Phase 4: Component Selection
+## Research Branches
 
-### 4a. LLM Model Selection — A Tiered Approach
+### `orchestrated`
 
-**Decision: tiered model strategy — the system is model-agnostic, model name is a configuration value.**
+**Central question**: can a supervising agent improve system behaviour — within a session, across sessions, and eventually at the level of graph topology — purely from observing execution traces and preference signals?
 
-**Task framing**: this is a *code comprehension + explanation* task, not code generation. The model must read retrieved code chunks, understand what they do, reason about relationships (dependencies, API endpoints, architecture), and explain in natural language. Reasoning capability — following multi-step logic across files — scales with parameter count and is the key differentiator between tiers.
+This branch adds a LangGraph-based supervisor to the pipeline. The supervisor is the frontier agent: it holds the broadest context, manages sub-agents, and is the only node responsible for preference learning. Centralising learning here keeps the failure modes contained and the update surface small.
 
-**Models evaluated**:
+#### Three optimisation loops
 
-| Model | Parameters | Strengths | Reasoning | Weaknesses |
-|-------|-----------|-----------|-----------|------------|
-| Mistral Nemo | 12B | Excellent code comprehension + explanation | Strong multi-step; traces cross-file dependencies | Needs GPU |
-| DeepSeek-Coder V2 Lite | 16B (MoE) | MoE excels at polyglot codebases | Strong within-context reasoning | Variable memory patterns |
-| Qwen2.5-Coder 7B | 7B | Best code comprehension at 7B tier | Adequate for single-file reasoning | May struggle with complex multi-module chains |
-| Phi-3.5 Mini | 3.8B | Runs almost anywhere | Best for straightforward "what does this function do" queries | Not code-specialised |
+**Short-loop (within a session)**
 
-*CodeLlama 7B was evaluated and excluded — Qwen2.5-Coder 7B supersedes it on modern benchmarks.*
+The supervisor observes confidence scores and latency across queries within a session and adjusts in real time: raises `top_k` if retrieval confidence is low, switches embedding model weighting if a particular file type is consistently missed, lowers the similarity score threshold if the corpus is sparse. This is close to what Self-RAG does internally, but externalised as a named, inspectable supervisor node — auditable via the `supervisor_adjustments` field in `AgentState`.
 
-**Tiered defaults**:
+Research question: what adjustment rules are stable? Which cause oscillation? The `SessionPreferences` dataclass (from `dev`) is the session-scoped preference state the supervisor reads and updates.
 
-1. **Full** — Mistral Nemo (12B). Best balance of explanation quality and code understanding. For polyglot codebases, DeepSeek-Coder V2 Lite is the recommended swap — recent research on MoE architectures confirms they're particularly effective for multi-language tasks, treating programming language diversity analogously to natural language multilingualism ([Wang et al., 2025](https://arxiv.org/abs/2508.19268)).
-2. **Balanced** — Qwen2.5-Coder 7B. Best-in-class at 7B. Right choice for ~8GB VRAM.
-3. **Lightweight** — Phi-3.5 Mini (3.8B). Edge, CPU-only, or resource-constrained deployments. Fine-tuning candidate.
+**Long-loop (across sessions, via MLflow)**
 
-**Hardware reality check**: frontier models reach trillions of parameters — three orders of magnitude above these. But without a multi-GPU system, models above ~16B aren't practical to serve. These tiers reflect models genuinely usable on realistic hardware.
+The supervisor reads the MLflow experiment log, detects patterns across many sessions — e.g. grep-based tools consistently outperform vector retrieval for certain query types — and proposes adjustments to graph parameters. This is not a large model doing the detection; it is closer to a classical anomaly detection or pattern mining problem over structured time-series data. The `supervisor_adjustments` audit trail from short-loop operation is the primary input.
 
-**Evolution of thinking — from fixed to composable:**
+Research question: which failure modes are systematic (appearing across sessions and users) versus idiosyncratic (specific to one session or user)? Systematic failures warrant graph-level changes; idiosyncratic ones are noise.
 
-The initial approach was to pick the best model and hard-code it. The shift came from asking: what does configurability actually mean in a Kubernetes-native deployment? Not just swapping a string, but a single high-level intent (`modelTier=lightweight`) that cascades through every dependent decision — which model to pull, memory to request, GPU requirements, context window, timeout. The `_helpers.tpl` implements this. A deployer expresses "I want the lightweight tier" and the system resolves the rest. This is the difference between configuration and *composable system design* — the same principle behind Kubernetes operators and Terraform modules.
+**Graph structure search (the deep research direction)**
 
-### 4b. Embedding Model
+Rather than tuning parameters within a fixed graph, the supervisor treats the graph topology itself as the search space. Which nodes should exist? Which edges should be conditional? This is not Neural Architecture Search in the gradient-based sense — LangGraph topologies are discrete and non-differentiable. The closer analogy is combinatorial search over graph topologies, with evolutionary or Bayesian optimisation over structure. The evaluation function is expensive (requires running the graph), which constrains the search strategy.
 
-**Decision: `nomic-embed-text` as default, with codebase-aware configuration.**
+This is the most novel direction and the least tractable in the near term. It belongs in `orchestrated` as a long-horizon research target rather than a near-term implementation goal.
 
-**Critical constraint — embedding compatibility**: you cannot mix embeddings from different models into a single index. Changing the embedding model requires full re-ingestion. The `_helpers.tpl` derives vector dimension from the embedding model choice automatically, preventing silent misconfiguration.
+#### Online preference learning (sub-module of `orchestrated`)
 
-**Codebase-aware embedding selection** — two axes characterise the input:
+The `online_preference/` sub-module within this branch implements three levels of preference adaptation, each progressively more aggressive:
 
-| Axis | States | Implication |
-|------|--------|-------------|
-| **Language distribution** | Primary-code (>90% one language) vs. Multi-code | Multi-code benefits from polyglot models; connects to DeepSeek LLM choice |
-| **Documentation state** | No-docs / Partial-docs / Review-and-revise | Review-and-revise is most demanding — must handle inconsistencies between code and prose |
+**Level 1 — Cross-session prior injection** (technically simple, empirically interesting)
 
-**Available models**:
+`SessionPreferences` from `dev` is session-scoped and in-memory. Level 1 serialises it to MLflow as a versioned artifact after each session; the next session loads the last artifact as a prior and injects it into the context. No model update — just context priming.
 
-| Model | Dimensions | Best for |
-|-------|-----------|----------|
-| `nomic-embed-text` | 768 | Partial-documentation codebases (default) |
-| `all-minilm` | 384 | Lightweight tier; resource-constrained |
-| `mxbai-embed-large` | 1024 | Complex codebases with dense documentation |
+Research question: does prior preference injection actually improve first-response quality? Measurable with the existing satisfaction scoring in the MLflow schema.
 
-**Evolution of thinking — from infrastructure choice to input-driven configuration:**
+**Level 2 — Online retrieval-layer adaptation** (moderate risk, contained failure modes)
 
-Initially the embedding model was treated as a pure infrastructure decision. The shift came when recognising that the *nature of the codebase* should inform the choice — and that the embedding model determines much of what's possible downstream. A raw-code-only repo needs strong code-native embeddings. A heavily-documented repo needs good code+text understanding. A polyglot repo needs polyglot awareness. This reframing — embedding selection as a property of the *input*, not the *infrastructure* — led to the two-axis characterisation. The implementation stays simple; the systematic understanding is documented for operators making informed deployment choices.
+Preference feedback adjusts retrieval weights, not LLM weights. Prioritised files get their embeddings boosted in the vector index; format preferences steer the context assembly ranking function. This is online learning operating on the retrieval layer, not the model layer — lower risk of destabilisation, more contained failure modes.
 
-### 4c. Vector Database
+Research question: does retrieval-layer adaptation converge or oscillate? What is the right learning rate? What triggers instability?
 
-**Decision: ChromaDB as default, behind a thin abstraction layer.**
+**Level 3 — Asynchronous / co-working agent feedback** (decision theory problem)
 
-An important distinction emerged during evaluation: **FAISS is a search index library, not a database**. It provides indexing algorithms (LSH, HNSW, IVF) but no persistence, metadata filtering, or API. Vector databases like ChromaDB and Qdrant use HNSW internally and wrap it with database functionality.
+Agents that operate while users are offline are a qualitatively different deployment context from interactive assistants. The feedback loop is asynchronous — the user reviews completed work post-hoc rather than correcting in real time. The preference update must be applied to the *next* agent invocation, not the current one. Standard RLHF assumes near-synchronous feedback; off-policy correction is needed here.
 
-| Solution | What it is | Persistence | Metadata filtering | Best fit |
-|----------|-----------|-------------|-------------------|----------|
-| **FAISS** | Search index library | None — you build it | None — you build it | Raw performance; custom systems needing LSH |
-| **ChromaDB** | Vector database (HNSW) | Built-in | Built-in | Developer convenience; small-to-medium codebases |
-| **Qdrant** | Vector database (HNSW) | Built-in | Built-in (richer) | Production; large codebases |
+Research question: how much prior preference data is sufficient to trust an agent operating unsupervised? This is a decision theory question with safety implications, not just a machine learning question. The conservative operating mode (low autonomy, high caution) vs. the extrapolating mode (operate on accumulated priors) represents a fundamental design choice with different risk profiles.
 
-For a code documentation assistant, **metadata filtering matters** — filtering by file type, directory, or language when searching. ChromaDB provides this out of the box. FAISS would require building all of that plumbing manually, or pairing it with a separate database for persistence and metadata.
+The concrete grounding experiment for Level 3 is the autonomous multi-context documentation task: the orchestrating agent traverses a full codebase, identifies all AST leaves touching a specific subsystem (e.g. the GUI surface), and documents each in turn — without human intervention, supervised only by the orchestrating agent's own context management. The task is bounded (the AST scope is well-defined), verifiable (the output is inspectable), and representative of the broader unsupervised operation problem.
 
-The abstraction layer preserves the ability to swap in FAISS+LSH or Qdrant later without changing application code. Pragmatic in implementation, extensible in design.
+#### Resource elasticity note
 
-**Evolution of thinking — FAISS, LSH, and knowing when to stop:**
+Online learning at the retrieval layer has an infrastructure cascade that is easy to miss. If the frontier agent's preference adaptation changes the ChromaDB index size, the embedding model weighting, or the effective memory footprint mid-deployment, that has downstream effects on Kubernetes resource requests, HPA targets, and potentially the Ollama/vLLM serving configuration. This is a day-1 vs day-2 operations distinction:
 
-LSH came up during evaluation as an alternative indexing strategy. Building persistence, metadata filtering, and CRUD on top of FAISS is substantial engineering with no practical benefit at this project's scale. ChromaDB behind an abstraction layer is the right trade-off — not over-engineering for hypothetical requirements, but not closing the door on them either.
+- **Day-1**: static resource provisioning based on model tier
+- **Day-2**: dynamic resource adjustment in response to learned behaviour changes
 
-### 4d. Orchestration Framework
+The `orchestrated` branch needs to document what triggers a day-2 resource event and what the response mechanism is. This is an infrastructure lifecycle question as much as an ML question.
 
-**Decision: LlamaIndex for the RAG pipeline; LangGraph adopted in `dev` for the agent pipeline.**
+#### The honest constraint
 
-LlamaIndex is purpose-built for RAG: native `CodeSplitter` with AST-aware chunking, tree-structured indexes, lighter weight than LangChain for pure retrieval-and-respond workflows.
-
-**Production orchestration**: MLflow (prototyping) → W&B (production monitoring) → Ray on K8s (distributed compute). Ray Serve wraps Ollama for load balancing; Ray Data enables parallel ingestion for large codebases; KubeRay deploys natively on K8s.
-
-**Evolution of thinking — from "which framework" to "what question am I actually answering":**
-
-The instinct was to reach for LangChain — it's the default answer for AI orchestration. But LangChain is a general-purpose framework; this project is focused RAG. The real orchestration question isn't "which framework chains my prompts" but "how does this system scale operationally?" That's answered by MLflow/W&B for tracking and Ray/K8s for compute, not by a prompt-chaining library. LangChain — specifically LangGraph — enters the picture when the *application scope* grows (agents, tool use, HITL, conditional graphs), which is exactly what the `dev` branch does.
-
-### 4e. Code Chunking Strategy
-
-**Decision: AST-based chunking via tree-sitter (LlamaIndex's `CodeSplitter`), with fixed-window fallback.**
-
-| Strategy | Strengths | Weaknesses |
-|----------|-----------|------------|
-| AST-based (tree-sitter) | Preserves logical units; language-aware | Requires valid, parseable code |
-| Heuristic / pattern-based | Works on broken code | Fragile; misses nested structures |
-| Fixed-window | Language-agnostic; never fails | Splits functions mid-body |
-| Hybrid (AST + fallback) | Best of both | Slightly more complex |
-
-The hybrid is the right choice: tree-sitter for clean code, graceful degradation to fixed-window for generated code, config files, and partial snippets.
-
-The chunking strategy is also **tier-configurable**: full/balanced tiers default to AST chunking; the lightweight tier defaults to text-based chunking (lower CPU/memory during ingestion). The `_helpers.tpl` resolves this from `modelTier` and cascades through to the app via the `CHUNKING_STRATEGY` environment variable — the same composability pattern applied to model selection.
-
-**Pipeline validation confirmed**: tree-sitter produced 41 semantic chunks from 7 Python files; the fallback handled text and config files correctly. Chunk distribution (e.g., `ingest.py` → 9 chunks, `config.py` → 2 chunks) shows the AST splitter respects logical boundaries rather than imposing uniform size.
-
-**Evolution of thinking — from "just split the text" to language-aware semantic boundaries:**
-
-Fixed-window chunking is the naive approach. A function split mid-body produces chunks that are individually meaningless. The AST-aware approach ensures a function, class, or method is always a complete unit. The tier-configurable fallback emerged later: for the lightweight tier already resource-constrained running Phi-3.5 on CPU, spending resources on AST parsing during ingestion may not be the right trade-off. This led to making chunking strategy part of the tier cascade — the same composability principle applied one more time.
-
-### 4f. Interface
-
-**Decision: Streamlit.**
-
-Streamlit provides a ChatGPT-style interface with `st.chat_input()` and `st.chat_message()` in pure Python — functional and clean.
-
-`master`: simple chat UI with sidebar ingestion controls.
-`dev`: tabbed layout — **Chat** (conversation + HITL widgets), **Pipeline** (full-width graph diagram with live execution trace highlighting), **Session** (accumulated preference profile, supervisor audit trail, MLflow run link).
-
-**Access patterns**:
-
-| Method | Context | Helm config |
-|--------|---------|-------------|
-| `kubectl port-forward` | Single developer, same machine | Default (ClusterIP) |
-| NodePort | Team on a private network | `--set app.service.type=NodePort` |
-| Ingress with TLS | Production / public access | `--set ingress.enabled=true` |
-
-**Evolution of thinking — access patterns and network realities:**
-
-The initial Helm setup offered ClusterIP + optional Ingress. Experience with multi-node private network deployments surfaced the NodePort gap: a team externally accessing the tool from other machines without an ingress controller. NodePort has a "dirty quick fix" reputation mainly because it's not secured for public-facing interfaces. For an internal code documentation tool on a private network — exactly where a tool handling proprietary code would run — NodePort is perfectly pragmatic. The "textbook" answer (always use Ingress) isn't always right; deployment context and network topology are the deciding factors.
-
-### 4g. RAG Quality and Limitations
-
-RAG is not unconditionally beneficial. Research shows retrieval noise can actively degrade output quality — irrelevant context can sometimes be worse than no context at all ([Gupta et al., 2024](https://arxiv.org/abs/2410.12837)).
-
-**Code documentation-specific RAG risks:**
-- **Stale context**: chunks from a previous version may contradict current code
-- **Partial context**: a function without its imports leads to incorrect explanations
-- **Cross-file confusion**: similar naming across modules causes conflation
-
-**Mitigations implemented**: similarity score cutoff (0.3), metadata preservation (file paths and languages in prompt), source attribution in every response.
-
-The `dev` branch extends this with two supervisor-level guardrails: a pre-generation confidence gate (retrieval quality check before the generation node runs) and a post-generation quality gate (rubric-scored LLM evaluation when `OUTPUT_REVIEW_MODE=supervisor`).
-
-**Evolution of thinking — from "RAG always helps" to understanding when it hurts:**
-
-The initial assumption was straightforward: retrieve relevant context, feed it to the LLM, get better answers. The key insight for code: the *quality* of retrieval matters more than the *quantity*. A function chunk without its import context may lead the LLM to hallucinate dependencies. A chunk from a similarly-named function in a different module may cause conflation. The similarity cutoff and metadata preservation are direct responses to these failure modes — not just "nice to have" filtering, but guardrails against specific RAG failure modes applied to code.
-
-### 4h. Guardrails
-
-For a code documentation tool, guardrails are domain-specific.
-
-**Hallucination prevention**: prompt template instructs the model to say "I don't have enough context" rather than guess; source attribution enables verification; similarity cutoff prevents irrelevant context from triggering confabulation.
-
-**Sensitive data protection**: code often contains credentials, API keys, and tokens. The system should detect and redact common patterns before including chunks in responses. Not implemented in the current version but a critical production requirement.
-
-**Bias and consistency**: tokenisation may weight variable naming conventions differently across languages. Mitigation: normalise code formatting before embedding; monitor response consistency.
-
-**Evolution of thinking — from "add a filter" to understanding code-specific risks:**
-
-Guardrails in general LLM applications focus on content moderation. For code documentation the risks are different — hallucinated file paths that don't exist, confidently wrong architectural explanations, leaked credentials embedded in code chunks. Source attribution is itself a guardrail: when the developer can see *which files* informed the answer, they can verify claims against actual code. This transforms the system from a black-box oracle into a transparent assistant.
+Online learning on LLM weights within a session is not the right target, for two reasons. First, feedback volume is too low — a few HITL signals per session is insufficient gradient signal to update a 7B+ parameter model meaningfully. Second, catastrophic forgetting: fine-tuning on a tiny session-specific dataset without regularisation damages general capabilities. The research opportunity is in the retrieval and context layers, where updates require less data and failure modes are more contained. LoRA/QLoRA across many sessions (the `fine-tuning` branch job) is the right mechanism for model-layer learning — not within-session updates.
 
 ---
 
-## Phase 5: Implementation
+### `emergent`
 
-Key outcomes:
-- **5 Python modules** (`config.py`, `vector_store.py`, `ingest.py`, `query_engine.py`, `app.py`) — each mapping to a distinct concern
-- **ChromaDB abstraction layer** — `VectorStoreBase` ABC with `ChromaVectorStoreImpl`; swappable to FAISS or Qdrant
-- **Tier-aware configuration** — `config.py` mirrors the Helm `_helpers.tpl` logic for Docker Compose parity, including model selection, resource allocation, embedding dimension, and chunking strategy
-- **AST chunking with tier-configurable fallback** — tree-sitter via LlamaIndex's `CodeSplitter` for full/balanced tiers; `SentenceSplitter` for lightweight tier; AST→text fallback always available as a safety net
-- **Pipeline validation test** (`tests/test_pipeline.py`) — end-to-end test using ChromaDB in embedded mode with lightweight local embeddings, validating the full ingest→chunk→store→retrieve pipeline without requiring external services
+**Central question**: can useful multi-agent coordination emerge from shared state alone, without a central supervisor?
 
-One implementation detail worth noting: `tree-sitter-language-pack` was discovered as a missing dependency during pipeline validation — LlamaIndex's `CodeSplitter` requires it for AST parsing, but it's not listed as a dependency of `llama-index-core`. Added to `requirements.txt` after confirming the fallback path worked correctly and the AST path needed the additional package.
+This branch removes the orchestrating supervisor entirely. Multiple agents operate in parallel, each with its own pipeline, coordinating only through a shared vector DB and a shared MLflow experiment log. No agent knows about the others' internal state — they only see what has been committed to shared state.
 
----
+The vector DB topology question is central here. Options include:
 
-## Phase 6: Testing & Refinement
+- **Agent-local indexes** — each agent has its own embedding model and its own index. Fully private, no cross-contamination, no shared knowledge.
+- **Shared DB, shared embedding model** — multiple agents index into the same vector space. Simple, but requires all agents to agree on one embedding model.
+- **Shared DB, heterogeneous embedding models** — different agents embed with different models, contributing to the same index via separate namespaces. Requires either namespace isolation within the DB or a cross-embedding-space alignment layer. The latter is an active research problem.
+- **Hierarchical DB** — agents have local indexes for fast private retrieval, with periodic propagation of selected knowledge upward to a shared index.
 
-**Resource constraints**: the full tier (Mistral Nemo 12B) requires a GPU and was not fully integration-tested. The lightweight tier (Phi-3.5, CPU-only) is the recommended tier for testing without GPU access. The code is tier-independent — switching tiers changes only model and resources, not application logic.
-
-**Pipeline validation results**:
-- All module imports validated ✅
-- Config tier resolution tested across all tiers ✅
-- File discovery: 18 files found (8 code, 10 text/config), correctly classified ✅
-- AST chunking: 41 code chunks from 7 Python files via tree-sitter ✅
-- ChromaDB storage: 58 total chunks stored in embedded mode ✅
-- Retrieval: 4/6 test queries hit expected files with test embeddings ✅
-
-Full local integration was also tested against a real repository. One issue encountered: the model returned `Error generating response: model requires more system memory (50.0 GiB) than is available (7.7 GiB)` when asked to document a specific file. This surfaced the gap between VRAM (what the GPU inference needs) and system RAM (what the error reports) — model quantisation and architecture can affect both independently. The cloud resource estimates in the README account for this with headroom above theoretical minimums.
-
-**Evolution of thinking — honesty over impression management:**
-
-The temptation was to gloss over resource constraints and imply thorough testing. The pipeline validation test was designed specifically to exercise as much of the codebase as possible *without* requiring external services. The 4/6 retrieval hit rate with character-trigram embeddings validates the pipeline mechanics; real Ollama embeddings would resolve the remaining misses. The principle throughout: be clear about what was tested, clear about what wasn't, and show you know the difference.
+Research question: at what task complexity does emergent coordination through shared state break down, and what coordination mechanism is the minimum viable addition to recover useful behaviour?
 
 ---
 
-## Phase 7: `dev` Branch — Why an Agent Pipeline?
+### `protocol-driven`
 
-The `master` branch answers "what does this code do?" reliably via a linear pipeline: ingest → embed → retrieve → respond. The `dev` branch asks a harder question: what if the system needed to *decide how* to find the answer — choosing between grep, AST parsing, vector search, or GitHub fetch depending on the query — and what if a human needed to review that plan before any tools ran?
+**Central question**: can initially informationally isolated agents — potentially belonging to different organisations — build productive collaboration through a negotiated protocol, without violating either party's information boundaries?
 
-This changes the execution model from a linear pipeline (fixed stages, predictable path) to a conditional graph (node routing, feedback loops, human interrupt points). The right tool for this is LangGraph.
+This branch implements the B2B cold-start collaboration model: two agents with no shared context, no prior relationship, no knowledge of each other's internal state. The collaboration is initiated through a handshake protocol, scoped to a specific shared goal, and terminated cleanly.
 
-**Evolution of thinking — from "add tools" to "redesign the execution model":**
+The protocol requires:
 
-The instinct was to layer tool use on top of the existing RAG pipeline. The reframe came from recognising that tool selection is itself a decision that benefits from human oversight — not because the LLM can't choose tools, but because in a code documentation context the human often has knowledge the tool-selection agent doesn't: which files are the canonical source of truth, which directories are generated and should be skipped, what the current task's scope actually is. HITL-1 (tool plan approval) exists to transfer that contextual knowledge into the pipeline before any tools execute.
+- **Capability and consent negotiation** — agents negotiate what they are willing to share, in what format, and for what purpose, before any substantive exchange.
+- **Joint context construction** — rather than sharing raw embeddings or documents, agents collaboratively construct a *joint context object*: a deliberately limited, mutually agreed representation of the shared problem space. Neither agent's private knowledge is exposed; only the intersection relevant to the collaborative goal.
+- **Directional information flow controls** — strict constraints on what propagates where, with audit trails. Agent A's proprietary knowledge never appears in Agent B's index.
+- **Goal anchoring** — the joint context is always scoped to a specific collaborative objective. Without this, shared context tends to drift and expand until privacy boundaries are violated.
+
+#### Federated preference aggregation
+
+The more speculative direction within this branch: if multiple organisations deploy instances of the same agent, each accumulating localised `SessionPreferences` histories, federated averaging over those preference profiles could produce a shared prior that outperforms any individual organisation's data.
+
+The key privacy question: are preference profiles — format preferences, verbosity, file prioritisation patterns — sufficiently abstract to aggregate safely without leaking task-specific or codebase-specific information? This is a non-trivial privacy analysis. The connection to federated learning (KubeFlower, FedAvg over model weights) is direct, but preference profiles are much lower-dimensional than model weights, which changes the re-identification risk calculus.
+
+Research question: does a federated prior outperform a local prior? At what data scale does federation become worthwhile? What is the differential privacy budget required to make preference sharing safe?
 
 ---
 
-## Phase 8: Agent Graph Design
+### `fine-tuning` (deferred)
 
-**Decision: LangGraph `StateGraph` with nine nodes and two configurable interrupt points.**
+LoRA/QLoRA on accumulated cross-session preference data. Model-weight learning only after sufficient data accumulation across many users and sessions — not within-session. This is the `fine-tuning` branch of `code-doc-assistant` applied to the research context: accumulated `SessionPreferences` histories from Level 1–3 of the `orchestrated` branch become the training signal.
+
+Not started until the `orchestrated` branch has produced sufficient instrumented data to make fine-tuning meaningful.
+
+---
+
+## Branch Dependency Map
 
 ```
-START → tool_selection →[HITL-1]→ tool_execution → supervisor ⟲
-      → context_assembly → generation → output_review →[HITL-2]→ END
+master  ──────────────────────────────────────────────────────────
+         │                    │                    │
+         ▼                    ▼                    ▼
+    orchestrated           emergent          protocol-driven
+         │
+         │  (consumes MLflow traces)
+         │◀─────────────────────────────── code-doc-assistant/dev
+         │
+         ▼
+    fine-tuning  (deferred, consumes orchestrated session data)
 ```
 
-`[HITL-1]` = `interrupt_before` on `hitl_checkpoint` when `HITL_ENABLED=true`
-`[HITL-2]` = behaviour controlled by `OUTPUT_REVIEW_MODE`
-
-**Graph topology is fixed regardless of `OUTPUT_REVIEW_MODE`**: the `output_review` node always exists and is always connected. The mode controls whether `interrupt_before` is set on it and what logic runs inside it at runtime. This is intentional — the graph structure is a stable contract; runtime behaviour is a configuration concern. It also means `get_graph_mermaid()` always renders the same topology in the Pipeline tab, regardless of mode.
-
-**The supervisor has two distinct responsibilities:**
-
-Pre-generation: evaluates retrieval confidence scores, injects `SessionPreferences` biases (preferred files, response format, verbosity), retries with adjusted parameters if confidence is below threshold.
-
-Post-generation (when `OUTPUT_REVIEW_MODE=supervisor`): evaluates the generated output against a rubric scoring accuracy (0–4), completeness (0–3), and attribution (0–3). Silently retries if total score is below `QUALITY_GATE_THRESHOLD`; accepts if it passes. Human feedback from previous queries (when `OUTPUT_REVIEW_MODE=human`) updates the `SessionPreferences` profile in `AgentState`, which persists across queries within the thread and biases subsequent supervisor behaviour.
-
-**`OUTPUT_REVIEW_MODE` values:**
-
-| Mode | Behaviour | Use case |
-|------|-----------|----------|
-| `human` | HITL-2 interrupt — human rates and decides (accept / regenerate / add context) | Default; highest oversight |
-| `supervisor` | Rubric LLM evaluates output; silent retry if below threshold | Automated quality gate |
-| `self` | Generation LLM self-critiques before emitting; no extra node | Lightweight sanity check |
-| `off` | Passthrough; immediate accept | CI/automated pipelines |
+`code-doc-assistant/dev` is an external dependency of `orchestrated`, not a branch of this repo. The MLflow schema defined in `instrumentation/mlflow_schema.py` is the contract between them.
 
 ---
 
-## Phase 9: Tool Registry
+## The Research Contribution
 
-**Decision: nine tools split between shell-level and semantic.**
+The novel framing, stated precisely: **retrieval-layer online learning as a proxy for preference adaptation, with federated aggregation of the resulting retrieval profiles as a privacy-preserving coordination mechanism across deployments.**
 
-Shell tools (`grep`, `cat`, `find`, `git_log`, `git_blame`, `stat`) often outperform semantic search for code documentation tasks — finding a function definition is a `grep` problem, not a vector similarity problem. Semantic tools (`vector_search`, `ast_parse`) handle conceptual questions and cross-file relationship queries. `github_fetch` handles cases where the repo isn't locally mounted.
-
-All shell tools validate paths against `REPO_PATH` and use an allowlisted flag set — no path escape, no arbitrary flag injection. The tool registry pattern (`TOOL_REGISTRY` dict mapping name → `{fn, description, required_args, optional_args}`) keeps tool logic in `tools.py` and graph logic in `agent_graph.py` with no coupling between them.
+This is specific enough to be a research contribution, grounded enough in the existing architecture to be tractable, and connected enough to the infrastructure lifecycle questions (day-1 vs day-2 ops, resource elasticity) to be practically relevant beyond the ML domain.
 
 ---
 
-## Phase 10: vLLM Integration
+## What This Is Not
 
-**Decision: `INFERENCE_BACKEND` env var switches between Ollama and vLLM at the `_get_llm()` factory — no other code changes required.**
+This repository does not pursue:
 
-vLLM exposes an OpenAI-compatible API. `ChatOpenAI` from `langchain-openai`, pointed at `VLLM_HOST/v1`, is functionally identical to any other LangChain chat model from the perspective of every graph node. The `api_key` field is set to `"not-required"` — vLLM ignores it entirely. All nine graph nodes call `_get_llm()` and are backend-agnostic.
+- Online learning on LLM weights within a session (feedback volume too low, catastrophic forgetting risk)
+- Full graph-search optimisation in the near term (the search space is discrete, evaluation is expensive, tooling is immature — it is documented as a long-horizon direction)
+- General-purpose agent frameworks (LangChain is documented as a future growth path; LlamaIndex is used where its RAG-native tooling is the right fit)
 
-`VLLM_MODEL` falls back to `OLLAMA_MODEL`, so `MODEL_TIER` continues to work as the single high-level control for both backends without additional configuration.
-
-The practical distinction between backends: Ollama is for developer convenience — auto-pull, CPU fallback, single-command setup. vLLM is for team deployments under concurrent load: continuous batching and PagedAttention make it significantly more efficient when multiple developers are using the tool simultaneously. The switch costs one environment variable.
-
-**Evolution of thinking — from "vLLM as a future note" to wired-in backend:**
-
-The initial ARCHITECTURE.md mentioned vLLM as a "what I'd do with more time" item and `query_engine.py` as the place to add it. In `dev`, it became clear that the right abstraction was the `_get_llm()` factory, not the query engine — the factory is the single point where a LangChain model is constructed, so backend-switching belongs there. The `langchain-openai` package provides `ChatOpenAI`, which handles the OpenAI-compatible API surface. The result is that vLLM is now a first-class deployment option rather than a future consideration, and swapping backends requires no application code changes.
-
----
-
-## Phase 11: MLflow — Both Branches
-
-**Decision: MLflow available in both branches, with different defaults.**
-
-`dev`: MLflow is always-on in `docker-compose.dev.yml`. Every query creates a run logging: inference backend, resolved model name, HITL settings, output review mode, retrieval confidence metrics, quality gate scores, user satisfaction rating, generation latency, tool calls executed. The Session tab in the Streamlit UI links directly to the last run's MLflow page.
-
-`master`: MLflow is opt-in via `--profile observability`. A plain `docker compose up` is entirely unchanged for existing users. Adding it to `master` rather than keeping it `dev`-only means the research repo's master branch can inherit it without needing to introduce a new service — it's already present in the compose file, gated behind a profile flag. The app handles a missing `MLFLOW_TRACKING_URI` gracefully throughout (all MLflow calls are in `try/except`).
-
-The MLflow-vs-W&B decision: W&B requires a licence for team use at scale. MLflow paired with Argo Workflows (Argo for orchestration, MLflow for tracking) covers the same functional ground with no licence cost and cleaner architectural separation of concerns. The combination also makes the system more composable for the research repo: MLflow run IDs become traceable links between code versions, embedding indexes, and the preference data accumulated from HITL interactions.
-
----
-
-## Phase 12: Argo Workflows
-
-**Decision: Argo `WorkflowTemplate` replaces the `ollama-bootstrap` one-shot container with a proper DAG.**
-
-```
-clone-or-mount → discover-files → chunk-code ─┐
-                                  chunk-text  ─┴→ embed-and-store → log-to-mlflow
-```
-
-`chunk-code` and `chunk-text` run in parallel (different file type sets). A `CronWorkflow` (suspended by default, enabled in production) handles nightly re-ingestion. This moves ingestion from "a thing that happens on container startup" to "a scheduled, observable, retryable pipeline with a logged artefact in MLflow."
-
-The MLflow step at the end of every ingestion run creates a traceable link between a specific code commit and the embedding index built from it — directly relevant for the research repo's cross-session preference work, where it matters which version of the codebase a preference signal was generated against.
-
----
-
-## Next Steps
-
-These are concrete, scoped extensions grounded in what's already built.
-
-### Advanced RAG Mitigations
-
-The similarity cutoff and metadata guardrails are a first line of defence. The next layer:
-
-- **CRAG (Corrective RAG)** — filtering low-confidence retrievals at inference time, reducing retrieval errors by 12–18%
-- **Self-RAG** — the model learns to critique its own retrieval usage, deciding whether retrieved context is relevant before incorporating it
-- **Re-ranking** — a secondary model re-scores retrieved chunks before they enter the prompt; computationally cheap relative to inference, but meaningfully improves retrieval precision
-- **Context windowing** — prioritising recently-modified files for timeliness; stale chunks are a known failure mode for active codebases
-
-### Chunking Granularity and Adaptive Retrieval
-
-The current implementation chunks at function/class level — well-suited for "what does this function do?" but less effective for "how do these modules interact?" An adaptive retrieval approach would maintain multiple index granularities simultaneously: function-level for local questions, file-level for module-level questions, cross-file summaries for architectural questions. The retrieval layer would select the appropriate granularity based on the query.
-
-### vLLM, Quantisation, and Production-Grade Inference
-
-Ollama is the right choice for developer convenience and self-contained deployment. In a production environment with known infrastructure, a different set of optimisations becomes relevant.
-
-**vLLM**: continuous batching, PagedAttention for efficient KV-cache management, native tensor parallelism across multiple GPUs. Where Ollama optimises for developer convenience, vLLM optimises for throughput and latency under concurrent load — critical when serving a team rather than a single developer. It supports OpenAI-compatible API endpoints, making it a drop-in replacement with minimal changes (already wired in `dev` via `_get_llm()`).
-
-**Quantisation** (GPTQ, AWQ, GGUF): reduces model memory footprint by 50–75% with minimal quality loss for code comprehension tasks. This would allow running the balanced tier on hardware currently limited to the lightweight tier, or the full tier on a single T4 via 4-bit quantisation. Beyond memory savings, quantisation can also increase context capacity and concurrent user support for the same resource envelope — a different set of trade-offs worth evaluating per deployment.
-
-**Context and sequence length**: larger context windows (32K+ tokens) enable ingesting entire files or multi-file contexts in a single query, directly addressing the chunking granularity problem. vLLM's PagedAttention makes long-context inference practical without proportional memory scaling.
-
-**Multi-GPU deployment**: tensor parallelism (splitting model layers across GPUs) and pipeline parallelism (splitting pipeline stages) become options with multiple GPUs. The embedding model and LLM could run on separate GPUs, eliminating the shared-VRAM constraint described in the README. Architecture-specific optimisations — FlashAttention-2 for Ampere+, INT8 on Turing, INT4 on Ampere, native FP4 on Blackwell (B100/B200/GB200) — continue to push the boundary of viable model sizes per GPU generation.
-
-**Network and switching**: in distributed deployments (separate nodes for inference, vector DB, and app), network topology matters — NVLink for multi-GPU communication, RDMA/InfiniBand for inter-node model parallelism, co-location of the app and vector DB to minimise retrieval latency.
-
-### Model Fine-Tuning
-
-The RAG approach means the model receives relevant context at query time, which is sufficient for most questions without fine-tuning. Fine-tuning becomes relevant if base models consistently fail on specific languages or domains, or if a particular documentation style is required. This requires training data (code Q&A pairs), compute, and iteration — guided by observed performance gaps, not assumed in advance.
-
-The `fine-tuning` branch (planned) would use LoRA/QLoRA adapters trained on HITL feedback accumulated in MLflow — cross-session, offline, and gated. This is not within-session fine-tuning: the feedback volume per session is too low and catastrophic forgetting risk is real. The right trigger is when MLflow contains enough preference signal to justify a training run.
-
-### Credential and Sensitive Data Redaction
-
-Code often contains credentials, API keys, and tokens embedded as literals or in config files. The current system includes chunks in responses without scanning for sensitive patterns. Detecting and redacting common credential formats before including chunks in the prompt is a critical production requirement, not a nice-to-have.
-
----
-
-## Wider Vision
-
-This section is explicitly a tangent — a larger architectural idea that emerged from building this system, kept separate to avoid scope creep but documented because it shows where this thinking leads.
-
-The code documentation assistant is a self-contained, useful system. It is also, viewed differently, a **reference implementation of a modular AI subsystem**: it has a well-defined interface (ingest a codebase, answer questions about it), a composable configuration model, clear abstraction boundaries, and a tiered deployment story. These properties make it a natural candidate for composition into a larger platform.
-
-### A Platform for Bespoke AI System Development
-
-The broader vision is a framework for building, fine-tuning, deploying, and continuously improving AI systems — not just for code documentation, but for any domain where a team needs a context-aware, locally-deployed AI assistant. The code documentation assistant would be one instantiation of this framework; others might include a test generation assistant, a security audit assistant, a migration planning assistant, and so on.
-
-The relationship between this project and that platform runs in both directions:
-
-**This system as a subsystem of the platform**: the code documentation assistant plugs into the platform as a module — its ingestion pipeline, embedding model, and query engine are reusable components. The platform orchestrates multiple such modules, routes queries to the appropriate assistant, and manages the shared infrastructure (Ollama cluster, vector DB fleet, model registry).
-
-**The platform as an optimisation service for this system**: conversely, the platform could provide services back to this assistant — a fine-tuning pipeline that trains on accumulated developer interactions, a model registry that manages tier upgrades, a distributed index that aggregates knowledge across teams and codebases. The assistant consumes these services without needing to implement them itself.
-
-This bidirectional composability — each system can be a client or a provider depending on the context — is the core architectural principle.
-
-### Branching Structure for a Multi-Environment System
-
-A natural evolution of the current project into a multi-branch, multi-environment system:
-
-- **`master`** — stable RAG pipeline; reviewer-friendly; single-command startup
-- **`dev`** — agent pipeline; LangGraph; HITL; vLLM; MLflow; Argo Workflows
-- **`fine-tuning`** — model adaptation; training data pipelines; LoRA/QLoRA experiments on Q&A pairs accumulated from HITL interactions
-- **`research`** (separate repo) — online preference learning; federated preference aggregation; autonomous multi-context agent orchestration; explicitly not production-bound
-
-The research repo is where the platform vision above would be prototyped — agentic pipelines that can autonomously ingest, embed, and index new codebases; agent-to-agent (A2A) coordination between specialised assistants; federated embeddings across teams where each node contributes to a shared index without centralising proprietary code.
-
-### LSH and Distributed AI
-
-During vector DB evaluation, LSH (Locality-Sensitive Hashing) came up as an alternative to HNSW. LSH offers compact binary representations, O(1) lookup, and sub-linear search time — relevant at scales well beyond this project. The broader question: can LSH enable **collectively and distributedly intelligent systems** where computational nodes and network topology contribute to a shared, scalable understanding of data, rather than centralising in a single vector database?
-
-Research directions being followed:
-- Reformer architecture's use of LSH attention for efficient long-sequence processing
-- GPU-optimised LSH with Winner-Take-All hashing and Cuckoo hash tables ([Shi et al., 2018](https://arxiv.org/abs/1806.00588))
-- PipeANN on aligning graph-based vector search with SSD characteristics for billion-scale datasets ([Guo & Lu, OSDI '25](https://www.usenix.org/system/files/osdi25-guo.pdf))
-
-In the platform context, LSH-based distributed indexing becomes a more compelling option — federated embeddings across teams, where each node contributes to a shared index without centralising proprietary code. The distributed AI question connects directly to the platform vision: scaling *understanding* across an organisation, not just scaling infrastructure.
-
-### Research Questions
-
-These are genuinely research-level questions — not implementation items — but they define the territory that the platform vision would need to address.
-
-**Study 1: Documentation state vs. compute requirements** — does a well-documented codebase require less inference compute to generate useful answers? Quantifying this relationship across model tiers × embedding models × codebase types would produce actionable guidance for platform operators: *for this type of codebase, this configuration is sufficient*.
-
-**Study 2: Autonomous continuous improvement across environments** — a code documentation assistant deployed at branch level learns from developer interactions (which answers were useful, which were wrong), and that learning propagates from branch → team → enterprise. Scaling *understanding*, not just infrastructure. This is the research-level version of the fine-tuning branch described above, and connects directly to the federated embeddings and distributed AI questions.
-
----
-
-## Engineering Standards
-
-- Python 3.11+, type hints throughout
-- Modular design: each source file maps to a single concern
-- Abstraction layers: `VectorStoreBase` ABC for DB-agnostic design; `_get_llm()` factory for backend-agnostic inference
-- Configuration: environment-variable driven, with parity between Docker Compose and Helm at every layer
-- Testing: pipeline validation with embedded ChromaDB; AST chunking verification; graph topology validation (`dev`)
-- Logging: structured logging via Python `logging` module, configurable level; MLflow for experiment-level tracking
+These exclusions are deliberate. The research is constrained to what is tractable with the existing infrastructure and data volumes, while pointing clearly toward longer-horizon directions.
