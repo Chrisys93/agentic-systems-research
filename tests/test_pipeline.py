@@ -11,6 +11,7 @@ In this test environment we cannot reach Ollama, so:
 
 Usage:
     python -m tests.test_pipeline
+    PYTHONPATH=./core python -m tests.test_pipeline
     MODEL_TIER=lightweight python -m tests.test_pipeline
 """
 
@@ -18,8 +19,10 @@ import sys
 import os
 import numpy as np
 
-# Ensure src is importable
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Ensure core/ and core/src/ are importable from repo root
+repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, repo_root)
+sys.path.insert(0, os.path.join(repo_root, "core"))
 
 import chromadb
 from llama_index.core import Document, VectorStoreIndex, StorageContext
@@ -104,7 +107,7 @@ def main():
     
     # --- Step 2: File discovery ---
     print(f"\n[2/6] File Discovery")
-    repo_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    repo_path = repo_root
     files = discover_files(repo_path)
     
     code_files = [f for f in files if f["type"] == "code"]

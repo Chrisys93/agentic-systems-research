@@ -7,7 +7,7 @@
 #   - HITL_ENABLED, OUTPUT_REVIEW_MODE, QUALITY_GATE_THRESHOLD
 #   - INFERENCE_BACKEND: "ollama" (default) | "vllm"
 #   - CONFIDENCE_THRESHOLD, MAX_RETRIEVAL_ATTEMPTS configurable
-#   - src/ bind-mount for live-reload during development
+#   - core/ and instrumentation/ bind-mount for live-reload during development
 #
 # Usage:
 #   docker compose -f docker-compose.dev.yml up --build
@@ -186,7 +186,8 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-info}
     volumes:
       - ${REPO_PATH:-./repos}:/data/repos:ro
-      - ./src:/app/src   # live-reload during development
+      - ./core:/app/core                         # live-reload during development
+      - ./instrumentation:/app/instrumentation   # live-reload during development
 
 volumes:
   ollama_data:

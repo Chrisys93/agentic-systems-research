@@ -25,12 +25,12 @@ st.set_page_config(
 # ---------------------------------------------------------------------------
 @st.cache_resource
 def _get_graph():
-    from agent_graph import build_graph
+    from core.agent_graph import build_graph
     from langgraph.checkpoint.memory import MemorySaver
     return build_graph(checkpointer=MemorySaver())
 
 def _get_mermaid() -> str:
-    from agent_graph import get_graph_mermaid
+    from core.agent_graph import get_graph_mermaid
     return get_graph_mermaid()
 
 # ---------------------------------------------------------------------------

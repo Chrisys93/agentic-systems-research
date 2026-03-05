@@ -1,6 +1,6 @@
-# llm-agent-research
+# Agentic Systems Research
 
-A research repository exploring advanced agentic AI system architectures, online learning mechanisms, and multi-agent coordination patterns. Forked from [code-doc-assistant](https://github.com/Chrisys93/code-doc-assistant) and generalised into a domain-agnostic pipeline skeleton.
+A research repository exploring advanced agentic AI system architectures, online learning mechanisms, and multi-agent coordination patterns. Imported from [code-doc-assistant](https://github.com/Chrisys93/code-doc-assistant) and generalised into a domain-agnostic research environment with the code documentation assistant retained as a working PoC.
 
 This repository is not a production system. It is a structured research environment where ideas from the `code-doc-assistant` project are extended, stress-tested, and explored at a depth that would be inappropriate in a product-oriented codebase.
 
@@ -8,7 +8,7 @@ This repository is not a production system. It is a structured research environm
 
 ## Relationship to `code-doc-assistant`
 
-The `code-doc-assistant` repo is a concrete instantiation of a RAG pipeline applied to a specific domain (code documentation). This repo is the generalisation: the same composable tier system, abstraction layers, and MLflow instrumentation, with the domain-specific parts removed. The code documentation assistant can be thought of as one possible instantiation of this skeleton; others could be a test generation assistant, a security audit assistant, a migration planning assistant, and so on.
+The `code-doc-assistant` repo is a concrete instantiation of a RAG pipeline applied to a specific domain (code documentation). This repo is the generalisation: the same composable tier system, abstraction layers, and MLflow instrumentation, with the research directions made explicit. The code documentation assistant is retained in `core/` as the working PoC — a real pipeline to instrument, test against, and incrementally adapt (e.g. one approach for Ollama, one for vLLM).
 
 The relationship runs in both directions:
 
@@ -20,25 +20,55 @@ The relationship runs in both directions:
 ## Repository Structure
 
 ```
-llm-agent-research/
-├── core/                        # Generic pipeline skeleton (this branch)
-│   ├── config.py                # Tier-aware configuration, mirrors code-doc-assistant logic
-│   ├── vector_store.py          # VectorStoreBase ABC — ChromaDB impl, swappable
-│   ├── ingest.py                # Domain-agnostic ingestion: discover, chunk, embed, store
-│   ├── query_engine.py          # Retrieval + prompt assembly, no domain assumptions
-│   └── app.py                   # Minimal Streamlit interface for pipeline testing
-├── instrumentation/
-│   ├── mlflow_schema.py         # Canonical MLflow logging schema (shared contract with dev)
-│   └── metrics.py               # Per-query metrics: confidence, latency, retrieval hit rate
-├── helm/                        # Helm chart (mirrors code-doc-assistant, domain-agnostic)
-├── docker-compose.yml           # Local dev: Ollama + ChromaDB + App
-├── docker-compose.gpu.yml       # GPU override
+agentic-systems-research/
+├── core/                              # Pipeline code (PoC retained from code-doc-assistant)
+│   ├── agent_graph.py                 # LangGraph StateGraph — conditional agent pipeline
+│   ├── agent_state.py                 # AgentState TypedDict + dataclasses (ToolCall, Chunk, etc.)
+│   ├── tools.py                       # Tool wrappers: grep, vector search, AST parse, GitHub fetch
+│   └── src/                           # RAG pipeline modules
+│       ├── __init__.py
+│       ├── app.py                     # Streamlit UI — chat + pipeline visualisation + session tab
+│       ├── config.py                  # Tier-aware configuration (mirrors Helm _helpers.tpl)
+│       ├── ingest.py                  # Ingestion: clone → discover → AST chunk → embed → store
+│       ├── query_engine.py            # Retrieval + prompt assembly + LLM response
+│       └── vector_store.py            # VectorStoreBase ABC — ChromaDB impl, swappable
+├── instrumentation/                   # MLflow logging contract + per-query metrics
+│   ├── __init__.py
+│   ├── mlflow_schema.py               # Canonical schema shared with code-doc-assistant/dev
+│   └── metrics.py                     # Computed metrics independent of MLflow
+├── helm/code-doc-assistant/           # Helm chart (mirrors code-doc-assistant, composable tiers)
+│   ├── Chart.yaml
+│   ├── values.yaml
+│   └── templates/
+│       ├── _helpers.tpl               # Tier → model, resources, embedding, chunking strategy
+│       ├── app-deployment.yaml
+│       ├── chromadb-statefulset.yaml
+│       ├── ollama-statefulset.yaml
+│       ├── vllm-deployment.yaml
+│       ├── mlflow-statefulset.yaml
+│       ├── services.yaml
+│       └── ingress.yaml
+├── argo/
+│   └── ingest-workflow.yaml           # Argo Workflows DAG for parallel codebase ingestion
+├── notebooks/
+│   └── pipeline_walkthrough.ipynb     # LangGraph graph visualisation + HITL demo
+├── tests/
+│   ├── __init__.py
+│   └── test_pipeline.py              # Pipeline validation with in-process ChromaDB
+├── Dockerfile                         # App container (copies core/ + instrumentation/)
+├── docker-compose.yml                 # Local dev: Ollama + ChromaDB + App
+├── docker-compose.dev.yml             # Dev: + MLflow (always-on), vLLM option, HITL config
+├── docker-compose.gpu.yml             # GPU override
+├── docker-compose.cpu.yml             # CPU-only override
 ├── requirements.txt
-├── run.sh
-└── ARCHITECTURE.md
+├── run.sh                             # Auto-detect GPU, default to lightweight tier
+├── run-cpu.sh                         # Force CPU-only
+├── LICENSE                            # Apache 2.0
+├── README.md
+└── ARCHITECTURE.md                    # Full research programme + design decisions
 ```
 
-Branch-specific code lives entirely within each branch — `master` contains only the shared skeleton and instrumentation layer that all branches build on.
+Branch-specific code lives entirely within each branch — `master` contains the shared skeleton, instrumentation layer, and the PoC pipeline that all branches build on.
 
 ---
 
@@ -52,8 +82,8 @@ Branch-specific code lives entirely within each branch — `master` contains onl
 ### Run locally
 
 ```bash
-git clone <repo-url>
-cd llm-agent-research
+git clone https://github.com/Chrisys93/agentic-systems-research.git
+cd agentic-systems-research
 ./run.sh                          # auto-detects GPU, defaults to lightweight tier
 ```
 
@@ -65,6 +95,28 @@ docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build  # GPU
 ```
 
 Open `http://localhost:8501`.
+
+### Dev mode (MLflow + agent pipeline)
+
+The dev compose file mirrors the [`code-doc-assistant` `dev` branch](https://github.com/Chrisys93/code-doc-assistant/tree/dev) environment — LangGraph agent graph with tool selection, HITL checkpoints, supervisor quality gates, and MLflow tracking always on. This is the environment where the `orchestrated` branch's research builds on top of.
+
+```bash
+docker compose -f docker-compose.dev.yml up --build
+
+# Automated mode (no human checkpoints):
+HITL_ENABLED=false OUTPUT_REVIEW_MODE=off \
+  docker compose -f docker-compose.dev.yml up
+
+# Supervisor quality gate instead of human review:
+OUTPUT_REVIEW_MODE=supervisor QUALITY_GATE_THRESHOLD=7.0 \
+  docker compose -f docker-compose.dev.yml up
+
+# vLLM backend (GPU required):
+INFERENCE_BACKEND=vllm \
+  docker compose -f docker-compose.dev.yml --profile vllm up
+```
+
+Access: `http://localhost:8501` (UI) · `http://localhost:5000` (MLflow)
 
 ### Model tiers
 
@@ -84,7 +136,7 @@ Each branch is a self-contained research direction built on top of this skeleton
 
 | Branch | Research direction | Status |
 |--------|--------------------|--------|
-| `master` | Generic pipeline skeleton | Active |
+| `master` | Pipeline skeleton + PoC + instrumentation layer | Active |
 | `orchestrated` | LangGraph supervisor, online preference learning, graph structure search | In design |
 | `emergent` | Multi-agent coordination through shared state only, no central supervisor | Planned |
 | `protocol-driven` | Federated preference aggregation, B2B cold-start collaboration | Planned |
@@ -112,6 +164,8 @@ The core logged fields per query:
 | `latency_ms` | int | End-to-end query latency |
 | `satisfaction_score` | int \| None | Explicit HITL feedback (1–5), if provided |
 | `session_preferences` | dict | Serialised `SessionPreferences` state at query time |
+
+The `instrumentation/metrics.py` module computes `QueryMetrics` from a final `AgentState` without touching MLflow — retrieval confidence stats, tool usage patterns, latency breakdowns, and feedback scores as a clean dataclass that can be logged, displayed, or fed into research pipelines independently.
 
 ---
 

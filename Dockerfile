@@ -11,13 +11,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy requirements first for layer caching
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-# RUN pip install --upgrade chromadb
 
 # Copy application code
-COPY src/ ./src/
+COPY core/ ./core/
+COPY instrumentation/ ./instrumentation/
 
-# Ensure src is importable as a package
-ENV PYTHONPATH=/app:/app/src
+# Ensure both packages are on the Python path
+ENV PYTHONPATH="/app:/app/core"
 
 # Streamlit config — disable telemetry, set port
 ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
@@ -26,7 +26,7 @@ ENV STREAMLIT_SERVER_ADDRESS=0.0.0.0
 
 EXPOSE 8501
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')"
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8501/_stcore/health || exit 1
 
-ENTRYPOINT ["streamlit", "run", "src/app.py", "--server.headless=true"]
+ENTRYPOINT ["streamlit", "run", "core/src/app.py", "--server.headless=true"]
